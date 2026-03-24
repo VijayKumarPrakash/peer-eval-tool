@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+venv/
+submissions/
+dl_group_*/
+rosters.py
+.DS_Store
