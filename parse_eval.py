@@ -36,6 +36,10 @@ from pathlib import Path
 from statistics import mean, stdev
 from typing import Optional
 
+GREEN = "\033[32m"
+RED   = "\033[31m"
+RESET = "\033[0m"
+
 import fitz  # PyMuPDF
 
 from rosters import SECTION_105, SECTION_106
@@ -267,8 +271,14 @@ def build_digit_tokens(
         sig = VisualSignature()
         sig.font_color = digit_chars[0][1].get("color", 0)
         sig.is_bold = any(is_bold_span(s) for _, s in digit_chars)
+        # Use digit center-point rather than full bbox overlap so that a highlight
+        # rect whose left edge merely touches the prior digit's right edge (a common
+        # artifact with Google Docs colored highlights) is not falsely attributed.
+        digit_cx = (x0 + x1) / 2
+        digit_cy = (y0 + y1) / 2
         for rect, fill in selection_rects:
-            if rects_overlap(x0, y0, x1, y1, rect.x0, rect.y0, rect.x1, rect.y1):
+            if (rect.x0 - 2 <= digit_cx <= rect.x1 + 2 and
+                    rect.y0 - 2 <= digit_cy <= rect.y1 + 2):
                 sig.bg_color = fill
                 break
 
@@ -325,7 +335,9 @@ def extract_score_from_tokens(tokens: list[DigitToken]) -> tuple[Optional[int], 
 # ---------------------------------------------------------------------------
 
 def normalize_label(s: str) -> str:
-    return s.strip().rstrip("?:").lower()
+    # Strip zero-width spaces (U+200B) Google Docs injects at span boundaries
+    # when colored highlights are applied, then strip normal whitespace.
+    return s.replace("\u200b", "").strip().rstrip("?:").lower()
 
 
 def detect_field_rows(page: fitz.Page) -> list[dict]:
@@ -615,59 +627,71 @@ def print_aggregates(section: int, aggregates: dict, total_files: int, processed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Parse MS 114 peer evaluation PDFs for a specific section"
+        description="Parse MS 114 peer evaluation PDFs"
     )
     parser.add_argument(
         "--path",
         required=True,
         type=Path,
-        help="Path to directory containing evaluation PDFs"
+        help="Path to a single PDF file, or a directory containing evaluation PDFs"
     )
     parser.add_argument(
         "--section",
-        required=True,
         type=int,
         choices=[105, 106],
-        help="Section number (105 or 106)"
+        help="Section number (105 or 106) — required when --path is a directory"
     )
-    
+
     args = parser.parse_args()
-    
-    # Validate directory exists
+
+    # ── Single-file mode ──────────────────────────────────────────────────────
+    if args.path.is_file():
+        if not args.path.suffix.lower() == ".pdf":
+            print(f"Error: {args.path} is not a PDF file", file=sys.stderr)
+            sys.exit(1)
+        result = parse_evaluation(str(args.path))
+        print_result(result)
+        sys.exit(0)
+
+    # ── Directory mode ────────────────────────────────────────────────────────
     if not args.path.is_dir():
-        print(f"Error: {args.path} is not a directory", file=sys.stderr)
+        print(f"Error: {args.path} is not a file or directory", file=sys.stderr)
         sys.exit(1)
-    
+
+    if args.section is None:
+        print("Error: --section is required when --path is a directory", file=sys.stderr)
+        sys.exit(1)
+
     # Find matching files
     print(f"Scanning {args.path} for section {args.section} students...")
     pdf_files = find_evaluation_files(args.path, args.section)
-    
+
     if not pdf_files:
         print(f"No evaluation files found for section {args.section}")
         sys.exit(0)
-    
+
     print(f"Found {len(pdf_files)} evaluation files. Processing...\n")
-    
+
     # Parse each file
     results = []
     skipped = 0
-    
+
     for pdf_path in pdf_files:
         try:
             result = parse_evaluation(str(pdf_path))
-            
+
             # Skip completely blank submissions
             if not result.scores:
-                print(f"  ⊘ SKIPPED (blank): {pdf_path.name}")
+                print(f"  {RED}⊘ SKIPPED (blank): {pdf_path.name}{RESET}")
                 skipped += 1
                 continue
-            
+
             results.append(result)
-            print(f"  ✓ {pdf_path.name}")
+            print(f"  {GREEN}✓ {pdf_path.name}{RESET}")
         except Exception as e:
-            print(f"  ✗ ERROR reading {pdf_path.name}: {e}")
+            print(f"  {RED}✗ ERROR reading {pdf_path.name}: {e}{RESET}")
             skipped += 1
-    
+
     # Compute aggregates
     aggregates = aggregate_results(results)
     
