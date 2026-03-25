@@ -5,3 +5,4 @@ submissions/
 dl_group_*/
 rosters.py
 .DS_Store
+.env

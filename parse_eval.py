@@ -23,9 +23,10 @@ bold flag. The token whose signature differs from all others is the selection.
 Usage:
     python parse_eval.py --path /path/to/evals --section 105
     python parse_eval.py --path /path/to/evals --section 106
+    python parse_eval.py --path /path/to/evals --section 105 --summarize
 
 Dependencies:
-    pip install pymupdf
+    pip install -r requirements.txt
 """
 
 import argparse
@@ -66,6 +67,14 @@ METRIC_LABELS = [
 
 # Lower scores are worse on these metrics
 INVERTED_METRICS = {"Too much reading of text", "Slides: cluttered with text"}
+
+# Form section-header strings that appear between metric rows but are NOT
+# student-written comments. Matched against normalized (lowercase, stripped) lines.
+FORM_STRUCTURE_PHRASES = frozenset({
+    "delivery",
+    "visual aids",
+    "discussion",
+})
 
 # Regex: full scale present  e.g.  1—2—3—4—5—6—7—8—9—10
 FULL_SCALE_RE = re.compile(
@@ -125,6 +134,7 @@ class EvalResult:
     score_methods: dict = field(default_factory=dict)  # metric → str
     good_point: str = ""
     murky_point: str = ""
+    item_comments: dict = field(default_factory=dict)  # metric → per-metric comment text
     warnings: list = field(default_factory=list)
 
 
@@ -396,6 +406,172 @@ def detect_field_rows(page: fitz.Page) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Section header row detection
+# ---------------------------------------------------------------------------
+
+def detect_section_header_rows(page: fitz.Page) -> list[dict]:
+    """
+    Find the y-band for each form section header (Content, Presentation,
+    Audience Engagement). These are not scoreable metrics but students
+    sometimes write comments next to them rather than next to specific
+    metric rows.
+
+    For "Audience Engagement", returns only the occurrence WITHOUT a nearby
+    1–10 scale (i.e. the section header, not the metric row which
+    detect_field_rows already handles).
+    """
+    words = page.get_text("words")
+
+    scale_y_centers: set[float] = set()
+    for wx0, wy0, wx1, wy1, wtext, *_ in words:
+        clean = wtext.replace("\u200b", "").strip()
+        if FULL_SCALE_RE.search(wtext) or LONE_NUMBER_RE.match(clean):
+            scale_y_centers.add(round((wy0 + wy1) / 2, 0))
+
+    def has_nearby_scale(y0: float, y1: float) -> bool:
+        mid = (y0 + y1) / 2
+        return any(abs(sy - mid) < 20 for sy in scale_y_centers)
+
+    result = []
+    for label in SECTION_HEADERS:
+        label_tokens = label.split()
+        n = len(label_tokens)
+        norm_first = normalize_label(label_tokens[0])
+
+        for i, (wx0, wy0, wx1, wy1, wtext, *_) in enumerate(words):
+            if normalize_label(wtext) != norm_first:
+                continue
+            if i + n > len(words):
+                continue
+            candidate = " ".join(words[j][4] for j in range(i, i + n))
+            if label.lower() not in candidate.lower():
+                continue
+            row_y0 = wy0 - 3
+            row_y1 = wy1 + 3
+            # "Audience Engagement" appears twice — skip the metric occurrence
+            if label == "Audience Engagement" and has_nearby_scale(row_y0, row_y1):
+                continue
+            result.append({"label": label, "y0": row_y0, "y1": row_y1})
+            break  # take the first valid (non-metric) occurrence
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Item-level comment extraction (per-metric text written beneath score rows)
+# ---------------------------------------------------------------------------
+
+def _find_good_point_y(words: list, last_metric_y: float) -> Optional[float]:
+    """Return the y0 of the 'Good point:' form label, searching only below the
+    last metric row to avoid false positives from student-written text."""
+    for i, w in enumerate(words):
+        if w[1] < last_metric_y:
+            continue
+        if normalize_label(w[4]) == "good" and i + 1 < len(words):
+            if normalize_label(words[i + 1][4]).startswith("point"):
+                return w[1]
+    return None
+
+
+def extract_item_comments(
+    page: fitz.Page,
+    field_rows: list[dict],
+    section_header_rows: list[dict] = None,
+) -> dict:
+    """
+    Extract qualitative comments from text appearing spatially between
+    consecutive anchor rows in the PDF.
+
+    Anchor rows are the 8 scoreable metric rows (field_rows) plus the
+    form section header rows (section_header_rows: Content, Presentation,
+    Audience Engagement).  Some students write free-text notes next to a
+    section header rather than next to a specific metric row, so both sets
+    of anchors are merged before scanning gaps.
+
+    Returns a dict mapping anchor_label → comment_text.
+    """
+    if not field_rows:
+        return {}
+
+    all_anchors = sorted(
+        list(field_rows) + (section_header_rows or []),
+        key=lambda r: r["y0"],
+    )
+    words = page.get_text("words")  # (x0, y0, x1, y1, text, ...)
+
+    # Use the last METRIC row's y as the sentinel start for finding "Good point:"
+    last_metric_y = max(r["y1"] for r in field_rows)
+    good_point_y = _find_good_point_y(words, last_metric_y)
+
+    comments = {}
+
+    for i, row in enumerate(all_anchors):
+        # Start the gap a few points below the anchor row's y-band so we don't
+        # accidentally pick up scale numbers or the anchor label itself.
+        gap_y0 = row["y1"] + 5
+        if i + 1 < len(all_anchors):
+            gap_y1 = all_anchors[i + 1]["y0"] - 3
+        elif good_point_y is not None:
+            gap_y1 = good_point_y - 3
+        else:
+            gap_y1 = row["y1"] + 200  # fallback: ~2.8 inches below last metric
+
+        if gap_y1 <= gap_y0:
+            continue
+
+        # Collect words in this spatial gap, filtering scale artifacts
+        gap_words = []
+        for wx0, wy0, wx1, wy1, wtext, *_ in words:
+            if not (gap_y0 <= wy0 <= gap_y1):
+                continue
+            clean = wtext.replace("\u200b", "").strip()
+            if not clean:
+                continue
+            # Skip scale digit artifacts (1–10) and separators
+            if clean.isdigit() and 1 <= int(clean) <= 10:
+                continue
+            if clean in {"-", "—", "–", "|"}:
+                continue
+            gap_words.append((wx0, wy0, clean))
+
+        if not gap_words:
+            continue
+
+        # Sort by (y, x) to reconstruct reading order
+        gap_words.sort(key=lambda w: (round(w[1]), w[0]))
+
+        # Group words into visual lines by y-proximity (tolerance = 4 pts)
+        lines: list[str] = []
+        current_line: list[str] = []
+        current_y: Optional[float] = None
+        for wx0, wy0, wtext in gap_words:
+            y_key = round(wy0)
+            if current_y is None or abs(y_key - current_y) <= 4:
+                current_line.append(wtext)
+                if current_y is None:
+                    current_y = y_key
+            else:
+                lines.append(" ".join(current_line))
+                current_line = [wtext]
+                current_y = y_key
+        if current_line:
+            lines.append(" ".join(current_line))
+
+        # Drop lines that are pure form-structure text (section headers)
+        comment_lines = []
+        for line in lines:
+            normalized = normalize_label(line.lower())
+            if normalized in FORM_STRUCTURE_PHRASES:
+                continue
+            comment_lines.append(line)
+
+        if comment_lines:
+            comments[row["label"]] = " ".join(comment_lines).strip()
+
+    return comments
+
+
+# ---------------------------------------------------------------------------
 # Qualitative text extraction
 # ---------------------------------------------------------------------------
 
@@ -435,7 +611,9 @@ def parse_evaluation(pdf_path: str) -> EvalResult:
     selection_rects = get_selection_rects(page)
 
     # Score each metric
-    for row in detect_field_rows(page):
+    field_rows = detect_field_rows(page)
+    section_header_rows = detect_section_header_rows(page)
+    for row in field_rows:
         label = row["label"]
         tokens = build_digit_tokens(page, row["y0"], row["y1"], selection_rects)
         score, method = extract_score_from_tokens(tokens)
@@ -447,6 +625,9 @@ def parse_evaluation(pdf_path: str) -> EvalResult:
             result.warnings.append(
                 f"Could not extract score for '{label}' — method={method}"
             )
+
+    # Per-metric/section item-level comments (text between consecutive anchor rows)
+    result.item_comments = extract_item_comments(page, field_rows, section_header_rows)
 
     # Qualitative (may span pages)
     all_texts = [doc[i].get_text() for i in range(len(doc))]
@@ -480,6 +661,11 @@ def print_result(r: EvalResult):
         print("\n  ⚠ Warnings:")
         for w in r.warnings:
             print(f"    - {w}")
+
+    if r.item_comments:
+        print("\n  Per-Metric Comments:")
+        for label, comment in r.item_comments.items():
+            print(f"    [{label}] {comment}")
 
     if r.good_point:
         print(f"\n  Good Point:\n    {r.good_point}")
@@ -641,6 +827,12 @@ if __name__ == "__main__":
         choices=[105, 106],
         help="Section number (105 or 106) — required when --path is a directory"
     )
+    parser.add_argument(
+        "--summarize",
+        action="store_true",
+        default=False,
+        help="After batch stats, call the Claude API to produce a prose qualitative summary per DL group"
+    )
 
     args = parser.parse_args()
 
@@ -697,6 +889,29 @@ if __name__ == "__main__":
     
     # Print results
     print_aggregates(args.section, aggregates, len(pdf_files), len(results))
-    
+
     if skipped > 0:
         print(f"Note: {skipped} file(s) skipped (blank or error)")
+
+    # Qualitative summarization (--summarize flag)
+    if args.summarize and results:
+        from summarize import summarize_qualitative
+        import textwrap
+
+        print("\n")
+        print("=" * 70)
+        print(f"  SECTION {args.section} QUALITATIVE SUMMARIES  ({len(results)} evaluations)")
+        print("=" * 70)
+        print()
+
+        try:
+            summary = summarize_qualitative(results, inverted_metrics=INVERTED_METRICS)
+            for line in summary.splitlines():
+                wrapped = textwrap.wrap(line, width=68) if line.strip() else [""]
+                for wl in wrapped:
+                    print(f"  {wl}")
+        except RuntimeError as e:
+            print(f"  [Error: {e}]")
+        except Exception as e:
+            print(f"  [API error: {e}]")
+        print()
